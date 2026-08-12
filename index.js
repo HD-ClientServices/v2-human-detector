@@ -8,6 +8,60 @@ const server = http.createServer(app);
 
 const deepgram = new DeepgramClient({ apiKey: process.env.DEEPGRAM_API_KEY });
 
+// ============================================================
+//  DETECTOR DE SALUDO HUMANO
+//  Patrones extraídos de grabaciones reales:
+//   Century      -> "Mel here with Century, on a recorded line"
+//   First Choice -> "This is John on a recorded line"
+//   Quantum      -> "Hey Heather, good morning, how are you doing?"
+// ============================================================
+const MARCADORES = {
+  identificacion: [
+    /\bthis is \w+/i,
+    /\b\w+ here with\b/i,
+    /\brecorded line\b/i,
+    /\brecording\b/i,
+    /\bmy name is\b/i,
+    /\bspeaking with\b/i,
+  ],
+  saludo: [
+    /\bhow are you\b/i,
+    /\bgood morning\b/i,
+    /\bgood afternoon\b/i,
+    /\bgood evening\b/i,
+    /\bhow's it going\b/i,
+    /\bhow can i help\b/i,
+  ],
+  verificacion: [
+    /\bis this \w+/i,
+    /\bam i speaking\b/i,
+  ],
+};
+
+const BUYERS = [/\bcentury\b/i, /\bfirst choice\b/i, /\bquantum\b/i];
+
+function detectarHumano(texto) {
+  const hits = [];
+
+  for (const [familia, patrones] of Object.entries(MARCADORES)) {
+    for (const p of patrones) {
+      if (p.test(texto)) {
+        hits.push(familia);
+        break;
+      }
+    }
+  }
+
+  for (const b of BUYERS) {
+    if (b.test(texto)) {
+      hits.push('buyer_name');
+      break;
+    }
+  }
+
+  return hits;
+}
+
 app.get('/', (req, res) => {
   res.send('v2-human-detector alive');
 });
@@ -21,6 +75,8 @@ wss.on('connection', async (ws) => {
   let chunkCount = 0;
   let dg = null;
   let dgReady = false;
+  let humanoDetectado = false;
+  const inicioLlamada = Date.now();
 
   try {
     dg = await deepgram.listen.v1.connect({
@@ -34,12 +90,25 @@ wss.on('connection', async (ws) => {
     });
 
     dg.on('message', (data) => {
-      console.log('🔎 DG msg type:', data.type);
       if (data.type === 'Results') {
         const transcript = data.channel?.alternatives?.[0]?.transcript;
         if (transcript && transcript.trim()) {
           const tipo = data.is_final ? 'FINAL' : 'parcial';
           console.log(`📝 [${tipo}] ${transcript}`);
+
+          if (!humanoDetectado) {
+            const hits = detectarHumano(transcript);
+            if (hits.length > 0) {
+              humanoDetectado = true;
+              const ms = Date.now() - inicioLlamada;
+              console.log('');
+              console.log('🚨🚨🚨 HUMANO DETECTADO 🚨🚨🚨');
+              console.log(`    a los ${(ms / 1000).toFixed(1)}s de iniciada la llamada`);
+              console.log(`    frase: "${transcript}"`);
+              console.log(`    señales: ${hits.join(', ')}`);
+              console.log('');
+            }
+          }
         }
       }
     });
@@ -57,7 +126,6 @@ wss.on('connection', async (ws) => {
     await dg.waitForOpen();
     dgReady = true;
     console.log('🎙️  Deepgram conectado y listo');
-    console.log('🔧 métodos:', Object.getOwnPropertyNames(Object.getPrototypeOf(dg)).join(', '));
   } catch (e) {
     console.error('❌ no se pudo conectar Deepgram:', e.message);
   }
@@ -91,7 +159,7 @@ wss.on('connection', async (ws) => {
         break;
 
       case 'stop':
-        console.log('⏹️  stop | chunks:', chunkCount);
+        console.log('⏹️  stop | chunks:', chunkCount, '| humano detectado:', humanoDetectado);
         if (dg) { try { dg.close(); } catch (e) {} }
         break;
     }
