@@ -1,68 +1,113 @@
 const express = require('express');
 const { WebSocketServer } = require('ws');
 const http = require('http');
+const { DeepgramClient } = require('@deepgram/sdk');
 
 const app = express();
 const server = http.createServer(app);
 
-// health check para Railway
+const deepgram = new DeepgramClient({ apiKey: process.env.DEEPGRAM_API_KEY });
+
 app.get('/', (req, res) => {
   res.send('v2-human-detector alive');
 });
 
-// WebSocket server para recibir el audio de Twilio Media Streams
 const wss = new WebSocketServer({ server, path: '/stream' });
 
-wss.on('connection', (ws) => {
+wss.on('connection', async (ws) => {
   console.log('🔌 Twilio Media Stream conectado');
 
-  let messageCount = 0;
-  let streamSid = null;
+  let callSid = null;
+  let chunkCount = 0;
+  let dg = null;
+  let dgReady = false;
+
+  try {
+    dg = await deepgram.listen.v1.connect({
+      model: 'nova-3',
+      language: 'en-US',
+      encoding: 'mulaw',
+      sample_rate: 8000,
+      channels: 1,
+      punctuate: true,
+      interim_results: true,
+    });
+
+    dg.on('message', (data) => {
+      console.log('🔎 DG msg type:', data.type);
+      if (data.type === 'Results') {
+        const transcript = data.channel?.alternatives?.[0]?.transcript;
+        if (transcript && transcript.trim()) {
+          const tipo = data.is_final ? 'FINAL' : 'parcial';
+          console.log(`📝 [${tipo}] ${transcript}`);
+        }
+      }
+    });
+
+    dg.on('error', (err) => {
+      console.error('❌ error Deepgram:', err);
+    });
+
+    dg.on('close', () => {
+      console.log('🎙️  Deepgram cerrado');
+      dgReady = false;
+    });
+
+    dg.connect();
+    await dg.waitForOpen();
+    dgReady = true;
+    console.log('🎙️  Deepgram conectado y listo');
+    console.log('🔧 métodos:', Object.getOwnPropertyNames(Object.getPrototypeOf(dg)).join(', '));
+  } catch (e) {
+    console.error('❌ no se pudo conectar Deepgram:', e.message);
+  }
 
   ws.on('message', (data) => {
     const msg = JSON.parse(data.toString());
 
     switch (msg.event) {
       case 'connected':
-        console.log('✅ evento: connected', JSON.stringify(msg));
+        console.log('✅ evento: connected');
         break;
 
       case 'start':
-        streamSid = msg.start.streamSid;
-        console.log('▶️  evento: start | streamSid:', streamSid);
-        console.log('    callSid:', msg.start.callSid);
-        console.log('    tracks:', JSON.stringify(msg.start.tracks));
+        callSid = msg.start.callSid;
+        console.log('▶️  start | callSid:', callSid);
         break;
 
       case 'media':
-        messageCount++;
-        // el audio viene en msg.media.payload (base64, mulaw 8kHz)
-        // logueamos cada 100 chunks para no saturar
-        if (messageCount % 100 === 0) {
-          console.log(`🎵 recibidos ${messageCount} chunks de audio | último ts: ${msg.media.timestamp}ms`);
+        chunkCount++;
+        if (dgReady && dg) {
+          try {
+            const audio = Buffer.from(msg.media.payload, 'base64');
+            if (chunkCount === 1) {
+              console.log('🔊 primer chunk, bytes:', audio.length);
+            }
+            dg.sendMedia(audio);
+          } catch (e) {
+            console.error('error enviando audio:', e.message);
+          }
         }
         break;
 
       case 'stop':
-        console.log('⏹️  evento: stop | total chunks recibidos:', messageCount);
+        console.log('⏹️  stop | chunks:', chunkCount);
+        if (dg) { try { dg.close(); } catch (e) {} }
         break;
-
-      default:
-        console.log('❓ evento desconocido:', msg.event);
     }
   });
 
   ws.on('close', () => {
-    console.log('🔌 Media Stream desconectado | total chunks:', messageCount);
+    console.log('🔌 Media Stream desconectado | chunks:', chunkCount);
+    if (dg) { try { dg.close(); } catch (e) {} }
   });
 
   ws.on('error', (err) => {
-    console.error('❌ error en WebSocket:', err.message);
+    console.error('❌ error WebSocket:', err.message);
   });
 });
 
 const PORT = process.env.PORT || 3000;
-server.listen(PORT,'0.0.0.0', () => {
+server.listen(PORT, '0.0.0.0', () => {
   console.log(`🚀 servidor escuchando en puerto ${PORT}`);
-  console.log(`   WebSocket path: /stream`);
 });
