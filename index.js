@@ -10,6 +10,8 @@ const server = http.createServer(app);
 const deepgram = new DeepgramClient({ apiKey: process.env.DEEPGRAM_API_KEY });
 const twilioClient = twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);
 
+const RETELL_SIP_HOST = 'sip.retellai.com';
+
 // ============================================================
 //  DETECTOR DE SALUDO HUMANO
 // ============================================================
@@ -60,14 +62,18 @@ wss.on('connection', (ws) => {
 
   let conferenceName = null;
   let buyerLabel = 'BUYER';
+  let leadName = '';
+  let leadDebt = '';
+  let leadPhone = '';
   let callSid = null;
   let chunkCount = 0;
   let dg = null;
   let dgReady = false;
   let humanoDetectado = false;
   const inicioLlamada = Date.now();
-  const bufferAudio = [];   // guarda audio que llega antes de que DG esté listo
+  const bufferAudio = [];
 
+  // mueve el buyer a la conference
   async function moverAConference() {
     if (!conferenceName || !callSid) {
       console.log('⚠️  falta conf o callSid | conf:', conferenceName, '| sid:', callSid);
@@ -82,7 +88,54 @@ wss.on('connection', (ws) => {
     }
   }
 
-  // ---- LISTENER PRIMERO: no perdemos el evento start ----
+  // registra y mete al agente de intro a la conference
+  async function meterAgenteIntro() {
+    if (!conferenceName) return;
+    try {
+      // 1. registrar con Retell
+      const r = await fetch('https://api.retellai.com/v2/register-phone-call', {
+        method: 'POST',
+        headers: {
+          Authorization: 'Bearer ' + process.env.RETELL_API_KEY,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          agent_id: process.env.RETELL_INTRO_AGENT_ID,
+          direction: 'inbound',
+          retell_llm_dynamic_variables: {
+            contact_first_name: leadName || 'the business owner',
+            mca_debt_total: leadDebt || '',
+            user_number: leadPhone || '',
+          },
+        }),
+      });
+      const reg = await r.json();
+      if (!reg.call_id) {
+        console.error('❌ intro: Retell no dio call_id', JSON.stringify(reg).slice(0, 200));
+        return;
+      }
+
+      // 2. originar la pierna del agente hacia la conference
+      //    endConferenceOnExit=false -> cuando el agente cuelga, la conf sigue viva
+      const introTwiml =
+        `<Response><Dial answerOnBridge="true"><Sip>sip:${reg.call_id}@${RETELL_SIP_HOST}</Sip></Dial></Response>`;
+
+      const confTwiml =
+        `<Response><Dial><Conference beep="false" startConferenceOnEnter="true" endConferenceOnExit="false">${conferenceName}</Conference></Dial></Response>`;
+
+      // creamos una llamada hacia el SIP de Retell que entra a la conference
+      const introCall = await twilioClient.calls.create({
+        to: `sip:${reg.call_id}@${RETELL_SIP_HOST}`,
+        from: process.env.INTRO_FROM_NUMBER || '+17274351309',
+        twiml: confTwiml,
+      });
+
+      console.log(`🗣️  agente de intro entrando | retell: ${reg.call_id} | sid: ${introCall.sid}`);
+    } catch (e) {
+      console.error('❌ error metiendo agente de intro:', e.message);
+    }
+  }
+
   ws.on('message', (data) => {
     let msg;
     try { msg = JSON.parse(data.toString()); } catch (e) { return; }
@@ -95,10 +148,14 @@ wss.on('connection', (ws) => {
       case 'start':
         callSid = msg.start.callSid;
         if (msg.start.customParameters) {
-          conferenceName = msg.start.customParameters.conf || null;
-          buyerLabel = msg.start.customParameters.buyer || 'BUYER';
+          const p = msg.start.customParameters;
+          conferenceName = p.conf || null;
+          buyerLabel = p.buyer || 'BUYER';
+          leadName = p.lead_name || '';
+          leadDebt = p.lead_debt || '';
+          leadPhone = p.lead_phone || '';
         }
-        console.log(`▶️  start | ${buyerLabel} | conf: ${conferenceName} | callSid: ${callSid}`);
+        console.log(`▶️  start | ${buyerLabel} | conf: ${conferenceName} | lead: ${leadName} | callSid: ${callSid}`);
         break;
 
       case 'media':
@@ -124,7 +181,6 @@ wss.on('connection', (ws) => {
 
   ws.on('error', (err) => console.error('❌ WS:', err.message));
 
-  // ---- DEEPGRAM DESPUES ----
   (async () => {
     try {
       dg = await deepgram.listen.v1.connect({
@@ -154,7 +210,9 @@ wss.on('connection', (ws) => {
                 console.log(`    frase: "${transcript}"`);
                 console.log(`    señales: ${[...r.fuertes, ...r.debiles].join(', ')}`);
                 console.log('');
+                // las dos cosas en paralelo
                 moverAConference();
+                meterAgenteIntro();
               }
             }
           }
@@ -167,9 +225,8 @@ wss.on('connection', (ws) => {
       dg.connect();
       await dg.waitForOpen();
       dgReady = true;
-      console.log(`🎙️  Deepgram listo (buffer: ${bufferAudio.length} chunks)`);
+      console.log(`🎙️  Deepgram listo (buffer: ${bufferAudio.length})`);
 
-      // mandamos lo que se acumuló mientras conectaba
       while (bufferAudio.length) {
         try { dg.sendMedia(bufferAudio.shift()); } catch (e) { break; }
       }
