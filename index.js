@@ -11,42 +11,106 @@ const deepgram = new DeepgramClient({ apiKey: process.env.DEEPGRAM_API_KEY });
 const twilioClient = twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);
 
 const RETELL_SIP_HOST = 'sip.retellai.com';
+const TIMEOUT_MS = 30000;
+const MAX_ATTEMPTS = 5;
 
 // ============================================================
 //  REGISTRO COMPARTIDO POR CONFERENCE
-//  { confName: { ganador: label|null, piernas: {label: callSid} } }
 // ============================================================
 const carreras = new Map();
 
-function registrarPierna(conf, label, callSid) {
-  if (!conf) return;
-  if (!carreras.has(conf)) carreras.set(conf, { ganador: null, piernas: {} });
-  carreras.get(conf).piernas[label] = callSid;
+function getCarrera(conf) {
+  if (!conf) return null;
+  if (!carreras.has(conf)) {
+    carreras.set(conf, { ganador: null, piernas: {}, agotados: new Set(), buyers: new Set(), rootSid: null });
+  }
+  return carreras.get(conf);
+}
+
+function registrarPierna(conf, label, callSid, rootSid) {
+  const c = getCarrera(conf);
+  if (!c) return;
+  c.piernas[label] = callSid;
+  c.buyers.add(label);
+  if (rootSid) c.rootSid = rootSid;
 }
 
 function hayGanador(conf) {
-  return conf && carreras.has(conf) && carreras.get(conf).ganador !== null;
+  const c = conf && carreras.get(conf);
+  return !!(c && c.ganador !== null);
 }
 
 function marcarGanador(conf, label) {
-  if (!conf || !carreras.has(conf)) return false;
-  const c = carreras.get(conf);
-  if (c.ganador !== null) return false;   // ya ganó otro
+  const c = conf && carreras.get(conf);
+  if (!c || c.ganador !== null) return false;
   c.ganador = label;
   return true;
 }
 
 async function cancelarPerdedores(conf, ganadorLabel) {
-  if (!conf || !carreras.has(conf)) return;
-  const c = carreras.get(conf);
+  const c = conf && carreras.get(conf);
+  if (!c) return;
   for (const [label, sid] of Object.entries(c.piernas)) {
     if (label === ganadorLabel) continue;
     try {
       await twilioClient.calls(sid).update({ status: 'completed' });
-      console.log(`   ✂️  cancelado ${label} (${sid})`);
+      console.log(`   ✂️  cancelado ${label}`);
     } catch (e) {
       console.log(`   ⚠️  no pude cancelar ${label}: ${e.message}`);
     }
+  }
+}
+
+async function marcarAgotado(conf, label) {
+  const c = conf && carreras.get(conf);
+  if (!c) return;
+  c.agotados.add(label);
+  console.log(`   🚫 ${label} agotó sus ${MAX_ATTEMPTS} intentos`);
+
+  const todosAgotados = [...c.buyers].every(b => c.agotados.has(b));
+  if (todosAgotados && c.ganador === null && c.rootSid) {
+    console.log(`   ☠️  todos los buyers agotados -> cortando al lead`);
+    try {
+      await twilioClient.calls(c.rootSid).update({
+        twiml: '<Response><Say language="en-US">We could not connect you right now. Goodbye.</Say><Hangup/></Response>',
+      });
+    } catch (e) {
+      console.error('   ❌ error cortando al lead:', e.message);
+    }
+    carreras.delete(conf);
+  }
+}
+
+async function reintentarBuyer(conf, label, number, attempt, leadName, leadDebt, leadPhone, rootSid) {
+  const siguiente = attempt + 1;
+  if (siguiente > MAX_ATTEMPTS) {
+    await marcarAgotado(conf, label);
+    return;
+  }
+  try {
+    const twiml =
+      '<Response><Start>' +
+      '<Stream url="wss://v2-human-detector.fly.dev/stream" track="inbound_track">' +
+      `<Parameter name="conf" value="${conf}"/>` +
+      `<Parameter name="buyer" value="${label}"/>` +
+      `<Parameter name="buyer_number" value="${number}"/>` +
+      `<Parameter name="attempt" value="${siguiente}"/>` +
+      `<Parameter name="lead_name" value="${leadName}"/>` +
+      `<Parameter name="lead_debt" value="${leadDebt}"/>` +
+      `<Parameter name="lead_phone" value="${leadPhone}"/>` +
+      `<Parameter name="root_sid" value="${rootSid}"/>` +
+      '</Stream></Start>' +
+      '<Pause length="300"/></Response>';
+
+    const c = await twilioClient.calls.create({
+      to: number,
+      from: process.env.INTRO_FROM_NUMBER || '+17274351309',
+      twiml,
+    });
+    console.log(`   🔁 reintento ${siguiente}/${MAX_ATTEMPTS} a ${label} | sid: ${c.sid}`);
+  } catch (e) {
+    console.error(`   ❌ error reintentando ${label}:`, e.message);
+    await marcarAgotado(conf, label);
   }
 }
 
@@ -100,16 +164,44 @@ wss.on('connection', (ws) => {
 
   let conferenceName = null;
   let buyerLabel = 'BUYER';
+  let buyerNumber = '';
+  let attempt = 1;
   let leadName = '';
   let leadDebt = '';
   let leadPhone = '';
+  let rootSid = '';
   let callSid = null;
   let chunkCount = 0;
   let dg = null;
   let dgReady = false;
   let yaProcesado = false;
+  let timerReintento = null;
   const inicioLlamada = Date.now();
   const bufferAudio = [];
+
+  function cancelarTimer() {
+    if (timerReintento) { clearTimeout(timerReintento); timerReintento = null; }
+  }
+
+  function armarTimer() {
+    cancelarTimer();
+    timerReintento = setTimeout(async () => {
+      if (yaProcesado || hayGanador(conferenceName)) return;
+      console.log(`⏱️  ${buyerLabel} sin humano en ${TIMEOUT_MS / 1000}s (intento ${attempt}/${MAX_ATTEMPTS})`);
+      yaProcesado = true;
+      try { await twilioClient.calls(callSid).update({ status: 'completed' }); } catch (e) {}
+      await reintentarBuyer(conferenceName, buyerLabel, buyerNumber, attempt, leadName, leadDebt, leadPhone, rootSid);
+    }, TIMEOUT_MS);
+  }
+
+  // el leg murio (buzon colgo, no contestaron, ocupado) sin humano -> reintentar ya
+  async function legTerminado(motivo) {
+    if (yaProcesado || hayGanador(conferenceName)) return;
+    yaProcesado = true;
+    cancelarTimer();
+    console.log(`⚰️  ${buyerLabel} leg terminado (${motivo}) | intento ${attempt}/${MAX_ATTEMPTS}`);
+    await reintentarBuyer(conferenceName, buyerLabel, buyerNumber, attempt, leadName, leadDebt, leadPhone, rootSid);
+  }
 
   async function moverAConference() {
     try {
@@ -174,12 +266,16 @@ wss.on('connection', (ws) => {
           const p = msg.start.customParameters;
           conferenceName = p.conf || null;
           buyerLabel = p.buyer || 'BUYER';
+          buyerNumber = p.buyer_number || '';
+          attempt = parseInt(p.attempt || '1', 10);
           leadName = p.lead_name || '';
           leadDebt = p.lead_debt || '';
           leadPhone = p.lead_phone || '';
+          rootSid = p.root_sid || '';
         }
-        registrarPierna(conferenceName, buyerLabel, callSid);
-        console.log(`▶️  start | ${buyerLabel} | conf: ${conferenceName} | callSid: ${callSid}`);
+        registrarPierna(conferenceName, buyerLabel, callSid, rootSid);
+        console.log(`▶️  ${buyerLabel} intento ${attempt}/${MAX_ATTEMPTS} | conf: ${conferenceName}`);
+        armarTimer();
         break;
 
       case 'media':
@@ -193,14 +289,15 @@ wss.on('connection', (ws) => {
         break;
 
       case 'stop':
-        console.log(`⏹️  stop | ${buyerLabel} | chunks: ${chunkCount}`);
         if (dg) { try { dg.close(); } catch (e) {} }
+        legTerminado('stop');
         break;
     }
   });
 
   ws.on('close', () => {
     if (dg) { try { dg.close(); } catch (e) {} }
+    legTerminado('ws_close');
   });
 
   ws.on('error', (err) => console.error('❌ WS:', err.message));
@@ -227,14 +324,15 @@ wss.on('connection', (ws) => {
               const r = detectarHumano(transcript);
               if (r.dispara) {
                 yaProcesado = true;
+                cancelarTimer();
                 const gane = marcarGanador(conferenceName, buyerLabel);
                 if (!gane) {
-                  console.log(`   (otro buyer ya había ganado, ignoro ${buyerLabel})`);
+                  console.log(`   (otro buyer ya ganó, ignoro ${buyerLabel})`);
                   return;
                 }
                 const ms = Date.now() - inicioLlamada;
                 console.log('');
-                console.log(`🚨 HUMANO DETECTADO en ${buyerLabel} a los ${(ms / 1000).toFixed(1)}s`);
+                console.log(`🚨 HUMANO DETECTADO en ${buyerLabel} a los ${(ms / 1000).toFixed(1)}s (intento ${attempt})`);
                 console.log(`    frase: "${transcript}"`);
                 console.log(`    señales: ${[...r.fuertes, ...r.debiles].join(', ')}`);
                 console.log('');
