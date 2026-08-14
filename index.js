@@ -13,6 +13,8 @@ const twilioClient = twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_A
 const RETELL_SIP_HOST = 'sip.retellai.com';
 const TIMEOUT_MS = 30000;
 const MAX_ATTEMPTS = 5;
+const GHL_LOCATION_ID = 'NXZFG9aQz6r1UXzZoedy';
+const GHL_CONTACT_SEARCH_URL = 'https://services.leadconnectorhq.com/contacts/search';
 
 // ============================================================
 //  REGISTRO COMPARTIDO POR CONFERENCE
@@ -115,11 +117,191 @@ async function reintentarBuyer(conf, label, number, attempt, leadName, leadDebt,
 }
 
 // ============================================================
-//  DETECTOR DE SALUDO HUMANO
+//  WEBHOOK AL CRM DEL BUYER
 // ============================================================
 
-// LISTA NEGRA: frases inequívocas de IVR/grabación.
-// Si aparece cualquiera, NO se dispara aunque haya otras señales.
+function s(v) {
+  if (v === null || v === undefined) return '';
+  const t = String(v).trim();
+  if (!t || t.includes('{{') || t.includes('}}')) return '';
+  return t;
+}
+
+// "Mar 3, 1985" / "1985-03-03" -> "1985-03-03"
+function toIsoDate(v) {
+  const raw = s(v);
+  if (!raw) return '';
+  if (/^\d{4}-\d{2}-\d{2}$/.test(raw)) return raw;
+  const d = new Date(raw);
+  if (isNaN(d.getTime())) return '';
+  return d.toISOString().slice(0, 10);
+}
+
+// "+16512406274" -> "6512406274"
+function toNationalPhone(v) {
+  const digits = s(v).replace(/[^0-9]/g, '');
+  return digits.length === 11 && digits.startsWith('1') ? digits.slice(1) : digits;
+}
+
+function toNumber(v) {
+  const n = String(s(v)).replace(/[^0-9.]/g, '');
+  return n === '' ? '' : String(Number(n));
+}
+
+async function buscarContactoGHL(phone) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 6000);
+  try {
+    const r = await fetch(GHL_CONTACT_SEARCH_URL, {
+      method: 'POST',
+      signal: controller.signal,
+      headers: {
+        Authorization: `Bearer ${process.env.GHL_PRIVATE_INTEGRATION_TOKEN}`,
+        Version: '2021-07-28',
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        locationId: GHL_LOCATION_ID,
+        pageLimit: 3,
+        filters: [{ field: 'phone', operator: 'eq', value: phone }],
+      }),
+    });
+    if (!r.ok) {
+      console.error('   ❌ GHL search fallo:', r.status);
+      return null;
+    }
+    const data = await r.json();
+    const contacts = Array.isArray(data.contacts) ? data.contacts : [];
+    return contacts[0] || null;
+  } catch (e) {
+    console.error('   ❌ GHL search error:', e.message);
+    return null;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+// arma el diccionario de placeholders desde el contacto de GHL
+function armarVariables(c, fallbackPhone, fallbackDebt) {
+  const cf = c.customFields || {};
+  const cv = (k) => {
+    // GHL puede devolver custom fields como array o como objeto
+    if (Array.isArray(cf)) {
+      const f = cf.find(x => (x.key || x.id || '').toLowerCase().includes(k.toLowerCase()));
+      return f ? (f.value ?? f.fieldValue ?? '') : '';
+    }
+    return cf[k] ?? '';
+  };
+
+  const phone = s(c.phone) || s(fallbackPhone);
+  const debt = s(c.credit_card_debt) || s(cv('credit_card_debt')) || s(fallbackDebt);
+  const first = s(c.firstName);
+  const last = s(c.lastName);
+
+  return {
+    ghl_contact_id: s(c.id),
+    first_name: first,
+    last_name: last,
+    full_name: s(c.contactName) || [first, last].filter(Boolean).join(' '),
+    email: s(c.email),
+    phone: phone,
+    phone_national: toNationalPhone(phone),
+    state: s(c.state) || s(cv('state_abb')),
+    address: s(c.address1),
+    city: s(c.city),
+    zip_code: s(c.postalCode),
+    company_name: s(c.companyName) || s(c.businessName),
+    debt: debt,
+    debt_number: toNumber(debt),
+    date_birth: s(c.dateOfBirth) || s(cv('date_birth')),
+    date_birth_iso: toIsoDate(s(c.dateOfBirth) || s(cv('date_birth'))),
+    // MCA (para RISE, cuando Sara migre)
+    mca_debt_total: s(cv('mca_debt_total')),
+    weekly_mca_payment: s(cv('weekly_mca_payment')),
+    hardship: s(cv('hardship')),
+    business_operating: s(cv('business_operating')),
+    affordable: s(cv('affordable')),
+    accounts_in_default: s(cv('accounts_in_default')),
+    legal_notices_or_liens: s(cv('legal_notices_or_liens')),
+    closer: s(cv('closer')),
+    opener: s(cv('opener')),
+  };
+}
+
+function rellenarTemplate(template, vars) {
+  const out = {};
+  for (const [k, v] of Object.entries(template)) {
+    out[k] = String(v).replace(/\{\{(\w+)\}\}/g, (_, name) => vars[name] ?? '');
+  }
+  return out;
+}
+
+async function traerBuyer(label) {
+  try {
+    const q = process.env.SUPABASE_URL +
+      '/rest/v1/v2_buyers?label=eq.' + encodeURIComponent(label) +
+      '&select=label,webhook_url,webhook_method,webhook_headers,webhook_content_type,webhook_template,webhook_active';
+    const r = await fetch(q, {
+      headers: {
+        apikey: process.env.SUPABASE_SERVICE_KEY,
+        Authorization: 'Bearer ' + process.env.SUPABASE_SERVICE_KEY,
+      },
+    });
+    const rows = await r.json();
+    return Array.isArray(rows) && rows[0] ? rows[0] : null;
+  } catch (e) {
+    console.error('   ❌ error trayendo buyer:', e.message);
+    return null;
+  }
+}
+
+async function dispararWebhookBuyer(buyerLabel, leadPhone, leadDebt) {
+  try {
+    const buyer = await traerBuyer(buyerLabel);
+    if (!buyer || !buyer.webhook_active || !buyer.webhook_url || !buyer.webhook_template) {
+      console.log(`   ℹ️  ${buyerLabel} sin webhook activo — no se manda nada`);
+      return;
+    }
+
+    const contacto = await buscarContactoGHL(leadPhone);
+    if (!contacto) {
+      console.error(`   ❌ webhook ${buyerLabel}: no encontre el contacto en GHL (${leadPhone})`);
+      return;
+    }
+
+    const vars = armarVariables(contacto, leadPhone, leadDebt);
+    const payload = rellenarTemplate(buyer.webhook_template, vars);
+
+    const headers = Object.assign({}, buyer.webhook_headers || {});
+    let body;
+    if (buyer.webhook_content_type === 'form') {
+      headers['Content-Type'] = 'application/x-www-form-urlencoded';
+      body = new URLSearchParams(payload).toString();
+    } else {
+      headers['Content-Type'] = 'application/json';
+      body = JSON.stringify(payload);
+    }
+
+    const r = await fetch(buyer.webhook_url, {
+      method: buyer.webhook_method || 'POST',
+      headers,
+      body,
+    });
+
+    if (r.ok) {
+      console.log(`   📤 webhook ${buyerLabel} OK (${r.status}) | contacto ${vars.ghl_contact_id}`);
+    } else {
+      const txt = await r.text().catch(() => '');
+      console.error(`   ❌ webhook ${buyerLabel} fallo ${r.status}: ${txt.slice(0, 200)}`);
+    }
+  } catch (e) {
+    console.error(`   ❌ webhook ${buyerLabel} error:`, e.message);
+  }
+}
+
+// ============================================================
+//  DETECTOR DE SALUDO HUMANO
+// ============================================================
 const IVR_BLOCKERS = [
   /\bthank you for calling\b/i,
   /\bthanks for calling\b/i,
@@ -147,7 +329,6 @@ const IVR_BLOCKERS = [
   /\bto speak (to|with) a\b/i,
 ];
 
-// FUERTES: dispara sola. Un IVR grabado no dice esto de forma dirigida.
 const FUERTES = [
   { id: 'this_is_nombre',   re: /\bthis is [a-z]{2,}/i },
   { id: 'its_nombre',       re: /\bit'?s [a-z]{2,} (here|with|from|on)\b/i },
@@ -167,7 +348,6 @@ const FUERTES = [
   { id: 'good_evening',     re: /\bgood evening\b/i },
 ];
 
-// DEBILES: necesitan 2. Sin thank_you ni buyer_name (puro IVR).
 const DEBILES = [
   { id: 'hello',      re: /\bhello\b/i },
   { id: 'hey_hi',     re: /\b(hey|hi)\b/i },
@@ -178,7 +358,6 @@ const DEBILES = [
 ];
 
 function detectarHumano(texto) {
-  // 1. si huele a IVR, se corta acá
   const blocker = IVR_BLOCKERS.find(re => re.test(texto));
   if (blocker) {
     return { dispara: false, bloqueado: blocker.source, fuertes: [], debiles: [] };
@@ -377,6 +556,7 @@ wss.on('connection', (ws) => {
                 cancelarPerdedores(conferenceName, buyerLabel);
                 moverAConference();
                 meterAgenteIntro();
+                dispararWebhookBuyer(buyerLabel, leadPhone, leadDebt);
               }
             }
           }
@@ -403,4 +583,3 @@ const PORT = process.env.PORT || 3000;
 server.listen(PORT, '0.0.0.0', () => {
   console.log(`🚀 servidor escuchando en puerto ${PORT}`);
 });
-
