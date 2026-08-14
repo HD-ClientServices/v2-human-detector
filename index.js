@@ -117,6 +117,37 @@ async function reintentarBuyer(conf, label, number, attempt, leadName, leadDebt,
 // ============================================================
 //  DETECTOR DE SALUDO HUMANO
 // ============================================================
+
+// LISTA NEGRA: frases inequívocas de IVR/grabación.
+// Si aparece cualquiera, NO se dispara aunque haya otras señales.
+const IVR_BLOCKERS = [
+  /\bthank you for calling\b/i,
+  /\bthanks for calling\b/i,
+  /\boffice(s)? (are |is )?(currently )?closed\b/i,
+  /\boffice hours\b/i,
+  /\bbusiness hours\b/i,
+  /\bplease (leave|call back|hold|stay|listen|press|visit)\b/i,
+  /\bleave a message\b/i,
+  /\bafter the (tone|beep)\b/i,
+  /\bpress (one|two|three|four|five|six|seven|eight|nine|zero|pound|star|\d)\b/i,
+  /\bfor further options\b/i,
+  /\byour call is (very )?important\b/i,
+  /\bnext available (agent|representative)\b/i,
+  /\bcurrently unavailable\b/i,
+  /\bunable to take your call\b/i,
+  /\brecord your message\b/i,
+  /\bmailbox\b/i,
+  /\bvoicemail\b/i,
+  /\bmonday through friday\b/i,
+  /\bdot com\b/i,
+  /\bw w w\b/i,
+  /\byou can (view|check|log)\b/i,
+  /\bdid you know\b/i,
+  /\bthank you for choosing\b/i,
+  /\bto speak (to|with) a\b/i,
+];
+
+// FUERTES: dispara sola. Un IVR grabado no dice esto de forma dirigida.
 const FUERTES = [
   { id: 'this_is_nombre',   re: /\bthis is [a-z]{2,}/i },
   { id: 'its_nombre',       re: /\bit'?s [a-z]{2,} (here|with|from|on)\b/i },
@@ -136,21 +167,25 @@ const FUERTES = [
   { id: 'good_evening',     re: /\bgood evening\b/i },
 ];
 
+// DEBILES: necesitan 2. Sin thank_you ni buyer_name (puro IVR).
 const DEBILES = [
   { id: 'hello',      re: /\bhello\b/i },
   { id: 'hey_hi',     re: /\b(hey|hi)\b/i },
   { id: 'whats_up',   re: /\bwhat'?s up\b/i },
   { id: 'yes_sir',    re: /\b(yes sir|yes ma'?am)\b/i },
   { id: 'okay',       re: /\b(okay|alright|all right)\b/i },
-  { id: 'buyer_name', re: /\b(century|first choice|quantum|rise|support)\b/i },
-  { id: 'thank_you',  re: /\bthank you\b/i },
   { id: 'appreciate', re: /\bappreciate\b/i },
 ];
 
 function detectarHumano(texto) {
+  // 1. si huele a IVR, se corta acá
+  const blocker = IVR_BLOCKERS.find(re => re.test(texto));
+  if (blocker) {
+    return { dispara: false, bloqueado: blocker.source, fuertes: [], debiles: [] };
+  }
   const fuertes = FUERTES.filter(m => m.re.test(texto)).map(m => m.id);
   const debiles = DEBILES.filter(m => m.re.test(texto)).map(m => m.id);
-  return { dispara: fuertes.length >= 1 || debiles.length >= 2, fuertes, debiles };
+  return { dispara: fuertes.length >= 1 || debiles.length >= 2, bloqueado: null, fuertes, debiles };
 }
 
 app.get('/', (req, res) => {
@@ -194,7 +229,6 @@ wss.on('connection', (ws) => {
     }, TIMEOUT_MS);
   }
 
-  // el leg murio (buzon colgo, no contestaron, ocupado) sin humano -> reintentar ya
   async function legTerminado(motivo) {
     if (yaProcesado || hayGanador(conferenceName)) return;
     yaProcesado = true;
@@ -322,6 +356,10 @@ wss.on('connection', (ws) => {
 
             if (!yaProcesado && !hayGanador(conferenceName)) {
               const r = detectarHumano(transcript);
+              if (r.bloqueado) {
+                console.log(`   🛑 IVR detectado (${r.bloqueado}) — no dispara`);
+                return;
+              }
               if (r.dispara) {
                 yaProcesado = true;
                 cancelarTimer();
@@ -365,3 +403,4 @@ const PORT = process.env.PORT || 3000;
 server.listen(PORT, '0.0.0.0', () => {
   console.log(`🚀 servidor escuchando en puerto ${PORT}`);
 });
+
