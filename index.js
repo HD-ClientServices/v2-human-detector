@@ -13,6 +13,14 @@ const twilioClient = twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_A
 const RETELL_SIP_HOST = 'sip.retellai.com';
 const TIMEOUT_MS = 30000;
 const MAX_ATTEMPTS = 5;
+const QA_DELAY_MS = 5 * 60 * 1000;   // 5 minutos: control de calidad del transfer
+// agente de intro por agent_key. Cada uno se presenta con su nombre y marca.
+const INTRO_AGENTS = {
+  sara: 'agent_246d82bf5f6708067a4913fbae',
+  anna: 'agent_693bab08a5c12de681337604c3',
+  kate: 'agent_6f6ac7991fc0831f4abd78524b',
+};
+
 const GHL_LOCATION_ID = 'NXZFG9aQz6r1UXzZoedy';
 const GHL_CONTACT_SEARCH_URL = 'https://services.leadconnectorhq.com/contacts/search';
 
@@ -83,7 +91,7 @@ async function marcarAgotado(conf, label) {
   }
 }
 
-async function reintentarBuyer(conf, label, number, attempt, leadName, leadDebt, leadPhone, rootSid) {
+async function reintentarBuyer(conf, label, number, attempt, leadName, leadDebt, leadPhone, rootSid, agentKey) {
   const siguiente = attempt + 1;
   if (siguiente > MAX_ATTEMPTS) {
     await marcarAgotado(conf, label);
@@ -95,6 +103,7 @@ async function reintentarBuyer(conf, label, number, attempt, leadName, leadDebt,
       '<Stream url="wss://v2-human-detector.fly.dev/stream" track="inbound_track">' +
       `<Parameter name="conf" value="${conf}"/>` +
       `<Parameter name="buyer" value="${label}"/>` +
+      `<Parameter name="agent_key" value="${agentKey}"/>` +
       `<Parameter name="buyer_number" value="${number}"/>` +
       `<Parameter name="attempt" value="${siguiente}"/>` +
       `<Parameter name="lead_name" value="${leadName}"/>` +
@@ -117,7 +126,7 @@ async function reintentarBuyer(conf, label, number, attempt, leadName, leadDebt,
 }
 
 // ============================================================
-//  WEBHOOK AL CRM DEL BUYER
+//  HELPERS DE DATOS
 // ============================================================
 
 function s(v) {
@@ -127,7 +136,6 @@ function s(v) {
   return t;
 }
 
-// "Mar 3, 1985" / "1985-03-03" -> "1985-03-03"
 function toIsoDate(v) {
   const raw = s(v);
   if (!raw) return '';
@@ -137,7 +145,6 @@ function toIsoDate(v) {
   return d.toISOString().slice(0, 10);
 }
 
-// "+16512406274" -> "6512406274"
 function toNationalPhone(v) {
   const digits = s(v).replace(/[^0-9]/g, '');
   return digits.length === 11 && digits.startsWith('1') ? digits.slice(1) : digits;
@@ -181,11 +188,9 @@ async function buscarContactoGHL(phone) {
   }
 }
 
-// arma el diccionario de placeholders desde el contacto de GHL
 function armarVariables(c, fallbackPhone, fallbackDebt) {
   const cf = c.customFields || {};
   const cv = (k) => {
-    // GHL puede devolver custom fields como array o como objeto
     if (Array.isArray(cf)) {
       const f = cf.find(x => (x.key || x.id || '').toLowerCase().includes(k.toLowerCase()));
       return f ? (f.value ?? f.fieldValue ?? '') : '';
@@ -215,7 +220,6 @@ function armarVariables(c, fallbackPhone, fallbackDebt) {
     debt_number: toNumber(debt),
     date_birth: s(c.dateOfBirth) || s(cv('date_birth')),
     date_birth_iso: toIsoDate(s(c.dateOfBirth) || s(cv('date_birth'))),
-    // MCA (para RISE, cuando Sara migre)
     mca_debt_total: s(cv('mca_debt_total')),
     weekly_mca_payment: s(cv('weekly_mca_payment')),
     hardship: s(cv('hardship')),
@@ -255,23 +259,25 @@ async function traerBuyer(label) {
   }
 }
 
+// manda el lead al CRM del buyer. devuelve el ghl_contact_id para el QA posterior.
 async function dispararWebhookBuyer(buyerLabel, leadPhone, leadDebt) {
+  let contactId = '';
   try {
-    const buyer = await traerBuyer(buyerLabel);
-    if (!buyer || !buyer.webhook_active || !buyer.webhook_url || !buyer.webhook_template) {
-      console.log(`   ℹ️  ${buyerLabel} sin webhook activo — no se manda nada`);
-      return;
-    }
-
     const contacto = await buscarContactoGHL(leadPhone);
     if (!contacto) {
-      console.error(`   ❌ webhook ${buyerLabel}: no encontre el contacto en GHL (${leadPhone})`);
-      return;
+      console.error(`   ❌ no encontre el contacto en GHL (${leadPhone})`);
+      return '';
+    }
+    const vars = armarVariables(contacto, leadPhone, leadDebt);
+    contactId = vars.ghl_contact_id;
+
+    const buyer = await traerBuyer(buyerLabel);
+    if (!buyer || !buyer.webhook_active || !buyer.webhook_url || !buyer.webhook_template) {
+      console.log(`   ℹ️  ${buyerLabel} sin webhook activo — no se manda nada al CRM`);
+      return contactId;
     }
 
-    const vars = armarVariables(contacto, leadPhone, leadDebt);
     const payload = rellenarTemplate(buyer.webhook_template, vars);
-
     const headers = Object.assign({}, buyer.webhook_headers || {});
     let body;
     if (buyer.webhook_content_type === 'form') {
@@ -289,7 +295,7 @@ async function dispararWebhookBuyer(buyerLabel, leadPhone, leadDebt) {
     });
 
     if (r.ok) {
-      console.log(`   📤 webhook ${buyerLabel} OK (${r.status}) | contacto ${vars.ghl_contact_id}`);
+      console.log(`   📤 webhook ${buyerLabel} OK (${r.status}) | contacto ${contactId}`);
     } else {
       const txt = await r.text().catch(() => '');
       console.error(`   ❌ webhook ${buyerLabel} fallo ${r.status}: ${txt.slice(0, 200)}`);
@@ -297,6 +303,73 @@ async function dispararWebhookBuyer(buyerLabel, leadPhone, leadDebt) {
   } catch (e) {
     console.error(`   ❌ webhook ${buyerLabel} error:`, e.message);
   }
+  return contactId;
+}
+
+// ============================================================
+//  CONTROL DE CALIDAD A LOS 5 MINUTOS
+//  Si la llamada del lead sigue viva -> sustained true (transfer cobrable)
+// ============================================================
+async function programarQA(datos) {
+  const { rootSid, buyerLabel, leadPhone, retellCallId, detectedAt, detectionSeconds, attempt, contactIdPromise } = datos;
+
+  setTimeout(async () => {
+    let callStatus = 'unknown';
+    let durationSeconds = 0;
+    let sustained = false;
+
+    try {
+      const call = await twilioClient.calls(rootSid).fetch();
+      callStatus = call.status;
+      durationSeconds = parseInt(call.duration || '0', 10);
+      sustained = call.status === 'in-progress';
+    } catch (e) {
+      console.error('   ❌ QA: no pude leer la llamada:', e.message);
+    }
+
+    const ghlContactId = (await contactIdPromise) || '';
+
+    const payload = {
+      sustained: sustained,
+      buyer: buyerLabel,
+      ghl_contact_id: ghlContactId,
+      lead_phone: leadPhone,
+      retell_call_id: retellCallId,
+      root_call_sid: rootSid,
+      detected_at: detectedAt,
+      detection_seconds: detectionSeconds,
+      attempt: attempt,
+      call_status: callStatus,
+      call_duration_seconds: durationSeconds,
+      checked_at: new Date().toISOString(),
+    };
+
+    console.log('');
+    console.log(`⏳ QA 5min | ${buyerLabel} | sustained: ${sustained} | status: ${callStatus} | dur: ${durationSeconds}s`);
+
+    try {
+      const url = process.env.GHL_QA_WEBHOOK_URL;
+      if (!url) {
+        console.log('   ℹ️  QA: falta GHL_QA_WEBHOOK_URL, no se manda');
+        return;
+      }
+      const r = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+      if (r.ok) {
+        console.log(`   📤 QA webhook a GHL OK (${r.status})`);
+      } else {
+        const txt = await r.text().catch(() => '');
+        console.error(`   ❌ QA webhook fallo ${r.status}: ${txt.slice(0, 200)}`);
+      }
+    } catch (e) {
+      console.error('   ❌ QA webhook error:', e.message);
+    }
+  }, QA_DELAY_MS);
+
+  console.log(`   ⏱️  QA programado en 5 min para ${buyerLabel}`);
 }
 
 // ============================================================
@@ -384,6 +457,7 @@ wss.on('connection', (ws) => {
   let leadDebt = '';
   let leadPhone = '';
   let rootSid = '';
+  let agentKey = '';
   let callSid = null;
   let chunkCount = 0;
   let dg = null;
@@ -404,7 +478,7 @@ wss.on('connection', (ws) => {
       console.log(`⏱️  ${buyerLabel} sin humano en ${TIMEOUT_MS / 1000}s (intento ${attempt}/${MAX_ATTEMPTS})`);
       yaProcesado = true;
       try { await twilioClient.calls(callSid).update({ status: 'completed' }); } catch (e) {}
-      await reintentarBuyer(conferenceName, buyerLabel, buyerNumber, attempt, leadName, leadDebt, leadPhone, rootSid);
+      await reintentarBuyer(conferenceName, buyerLabel, buyerNumber, attempt, leadName, leadDebt, leadPhone, rootSid, agentKey);
     }, TIMEOUT_MS);
   }
 
@@ -413,7 +487,7 @@ wss.on('connection', (ws) => {
     yaProcesado = true;
     cancelarTimer();
     console.log(`⚰️  ${buyerLabel} leg terminado (${motivo}) | intento ${attempt}/${MAX_ATTEMPTS}`);
-    await reintentarBuyer(conferenceName, buyerLabel, buyerNumber, attempt, leadName, leadDebt, leadPhone, rootSid);
+    await reintentarBuyer(conferenceName, buyerLabel, buyerNumber, attempt, leadName, leadDebt, leadPhone, rootSid, agentKey);
   }
 
   async function moverAConference() {
@@ -435,7 +509,7 @@ wss.on('connection', (ws) => {
           'Content-Type': 'application/json',
         },
         body: JSON.stringify({
-          agent_id: process.env.RETELL_INTRO_AGENT_ID,
+          agent_id: INTRO_AGENTS[agentKey] || process.env.RETELL_INTRO_AGENT_ID,
           direction: 'inbound',
           retell_llm_dynamic_variables: {
             contact_first_name: leadName || 'the business owner',
@@ -459,7 +533,7 @@ wss.on('connection', (ws) => {
         twiml: confTwiml,
       });
 
-      console.log(`🗣️  agente de intro entrando | sid: ${introCall.sid}`);
+      console.log(`🗣️  agente de intro (${agentKey || 'default'}) entrando | sid: ${introCall.sid}`);
     } catch (e) {
       console.error('❌ error metiendo agente de intro:', e.message);
     }
@@ -485,6 +559,7 @@ wss.on('connection', (ws) => {
           leadDebt = p.lead_debt || '';
           leadPhone = p.lead_phone || '';
           rootSid = p.root_sid || '';
+          agentKey = (p.agent_key || '').toLowerCase();
         }
         registrarPierna(conferenceName, buyerLabel, callSid, rootSid);
         console.log(`▶️  ${buyerLabel} intento ${attempt}/${MAX_ATTEMPTS} | conf: ${conferenceName}`);
@@ -548,15 +623,30 @@ wss.on('connection', (ws) => {
                   return;
                 }
                 const ms = Date.now() - inicioLlamada;
+                const detectedAt = new Date().toISOString();
                 console.log('');
                 console.log(`🚨 HUMANO DETECTADO en ${buyerLabel} a los ${(ms / 1000).toFixed(1)}s (intento ${attempt})`);
                 console.log(`    frase: "${transcript}"`);
                 console.log(`    señales: ${[...r.fuertes, ...r.debiles].join(', ')}`);
                 console.log('');
+
                 cancelarPerdedores(conferenceName, buyerLabel);
                 moverAConference();
                 meterAgenteIntro();
-                dispararWebhookBuyer(buyerLabel, leadPhone, leadDebt);
+
+                // el webhook al CRM devuelve el ghl_contact_id, que el QA reusa
+                const contactIdPromise = dispararWebhookBuyer(buyerLabel, leadPhone, leadDebt);
+
+                programarQA({
+                  rootSid,
+                  buyerLabel,
+                  leadPhone,
+                  retellCallId: conferenceName ? conferenceName.replace('transfer_', '') : '',
+                  detectedAt,
+                  detectionSeconds: Number((ms / 1000).toFixed(1)),
+                  attempt,
+                  contactIdPromise,
+                });
               }
             }
           }
