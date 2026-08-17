@@ -15,6 +15,14 @@ const TIMEOUT_MS = 30000;
 const MAX_ATTEMPTS = 5;
 const QA_DELAY_MS = 5 * 60 * 1000;   // 5 minutos: control de calidad del transfer
 // agente de intro por agent_key. Cada uno se presenta con su nombre y marca.
+// numero de origen por agente: los reintentos y el agente de intro
+// salen desde el numero real del agente, nunca desde uno fijo.
+const AGENT_FROM_NUMBERS = {
+  sara: '+18455061524',
+  anna: '+15755776848',
+  kate: '+16615603867',
+};
+
 const INTRO_AGENTS = {
   sara: 'agent_246d82bf5f6708067a4913fbae',
   anna: 'agent_693bab08a5c12de681337604c3',
@@ -115,7 +123,7 @@ async function reintentarBuyer(conf, label, number, attempt, leadName, leadDebt,
 
     const c = await twilioClient.calls.create({
       to: number,
-      from: process.env.INTRO_FROM_NUMBER || '+17274351309',
+      from: AGENT_FROM_NUMBERS[agentKey] || process.env.INTRO_FROM_NUMBER,
       twiml,
     });
     console.log(`   🔁 reintento ${siguiente}/${MAX_ATTEMPTS} a ${label} | sid: ${c.sid}`);
@@ -188,18 +196,39 @@ async function buscarContactoGHL(phone) {
   }
 }
 
+// GHL devuelve los custom fields SOLO con su ID interno, nunca con el nombre.
+// Buscarlos por nombre siempre falla y el buyer recibe el lead con campos vacios.
+// Si se crea un campo nuevo en GHL, agregarlo aca
+// (GET /locations/{id}/customFields lista todos).
+const CF_IDS = Object.freeze({
+  Wwfo9AgAhsWDaC0X92fN: 'state_abb',
+  AmWaQD4N9LeNS5IC6vqA: 'credit_card_debt',
+  h5IfedXXr4XpqJMTp1c6: 'mca_debt_total',
+  uGu8Wki98qbiNm0VOlqI: 'weekly_mca_payment',
+  W3IDP3yQoHcNaMlgImz5: 'monthly_payment',
+  '5YhnLnXIFcgBQDWZwsoc': 'hardship',
+  WjBAR7mpEbKUBMbIoIp8: 'business_operating',
+  GBKoQX8B53Uop1mrEu9T: 'affordable',
+  N6TtGsAs5eMGUZQ0SJKZ: 'accounts_in_default',
+  XaXl6ZiwOdV7ezJUYDm9: 'legal_notices_or_liens',
+  '1Dx0EmFl4j3yGGszs494': 'closer',
+  '12QlJpsyMsXbAwJiWN3K': 'opener',
+  '5YdVdXFnxlyHnBwhDVAW': 'business_owner',
+});
+
 function armarVariables(c, fallbackPhone, fallbackDebt) {
-  const cf = c.customFields || {};
-  const cv = (k) => {
-    if (Array.isArray(cf)) {
-      const f = cf.find(x => (x.key || x.id || '').toLowerCase().includes(k.toLowerCase()));
-      return f ? (f.value ?? f.fieldValue ?? '') : '';
+  const campos = {};
+  const raw = (c && c.customFields) || [];
+  if (Array.isArray(raw)) {
+    for (const f of raw) {
+      const key = CF_IDS[f.id];
+      if (key) campos[key] = s(f.value !== undefined ? f.value : f.fieldValue);
     }
-    return cf[k] ?? '';
-  };
+  }
+  const cv = (k) => campos[k] || '';
 
   const phone = s(c.phone) || s(fallbackPhone);
-  const debt = s(c.credit_card_debt) || s(cv('credit_card_debt')) || s(fallbackDebt);
+  const debt = s(cv('credit_card_debt')) || s(c.credit_card_debt) || s(fallbackDebt);
   const first = s(c.firstName);
   const last = s(c.lastName);
 
@@ -211,7 +240,7 @@ function armarVariables(c, fallbackPhone, fallbackDebt) {
     email: s(c.email),
     phone: phone,
     phone_national: toNationalPhone(phone),
-    state: s(c.state) || s(cv('state_abb')),
+    state: (s(cv('state_abb')) || s(c.state)).toUpperCase(),
     address: s(c.address1),
     city: s(c.city),
     zip_code: s(c.postalCode),
@@ -529,7 +558,7 @@ wss.on('connection', (ws) => {
 
       const introCall = await twilioClient.calls.create({
         to: `sip:${reg.call_id}@${RETELL_SIP_HOST}`,
-        from: process.env.INTRO_FROM_NUMBER || '+17274351309',
+        from: AGENT_FROM_NUMBERS[agentKey] || process.env.INTRO_FROM_NUMBER,
         twiml: confTwiml,
       });
 
