@@ -170,6 +170,45 @@ function toNumber(v) {
   return n === '' ? '' : String(Number(n));
 }
 
+async function traerContactoPorId(contactId) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 6000);
+  try {
+    const r = await fetch('https://services.leadconnectorhq.com/contacts/' + encodeURIComponent(contactId), {
+      signal: controller.signal,
+      headers: {
+        Authorization: `Bearer ${process.env.GHL_PRIVATE_INTEGRATION_TOKEN}`,
+        Version: '2021-07-28',
+      },
+    });
+    if (!r.ok) { console.error('   GHL get by id fallo:', r.status); return null; }
+    const data = await r.json();
+    return data.contact || null;
+  } catch (e) {
+    console.error('   GHL get by id error:', e.message);
+    return null;
+  } finally { clearTimeout(timeout); }
+}
+
+async function contactIdDeLaConference(conf) {
+  if (!conf) return '';
+  try {
+    const sufijo = conf.replace('transfer_', '');
+    const q = process.env.SUPABASE_URL +
+      '/rest/v1/v2_call_map?retell_call_id=like.*' + encodeURIComponent(sufijo) +
+      '&select=metadata&limit=1';
+    const r = await fetch(q, {
+      headers: {
+        apikey: process.env.SUPABASE_SERVICE_KEY,
+        Authorization: 'Bearer ' + process.env.SUPABASE_SERVICE_KEY,
+      },
+    });
+    const rows = await r.json();
+    const meta = (Array.isArray(rows) && rows[0] && rows[0].metadata) || {};
+    return meta.ghl_contact_id || '';
+  } catch (e) { return ''; }
+}
+
 async function buscarContactoGHL(phone) {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 6000);
@@ -296,10 +335,14 @@ async function traerBuyer(label) {
 }
 
 // manda el lead al CRM del buyer. devuelve el ghl_contact_id para el QA posterior.
-async function dispararWebhookBuyer(buyerLabel, leadPhone, leadDebt) {
+async function dispararWebhookBuyer(buyerLabel, leadPhone, leadDebt, conf) {
   let contactId = '';
   try {
-    const contacto = await buscarContactoGHL(leadPhone);
+    await new Promise((r) => setTimeout(r, 10000));
+    let contacto = null;
+    const idGuardado = await contactIdDeLaConference(conf);
+    if (idGuardado) contacto = await traerContactoPorId(idGuardado);
+    if (!contacto) contacto = await buscarContactoGHL(leadPhone);
     if (!contacto) {
       console.error(`   ❌ no encontre el contacto en GHL (${leadPhone})`);
       return '';
@@ -324,6 +367,7 @@ async function dispararWebhookBuyer(buyerLabel, leadPhone, leadDebt) {
       body = JSON.stringify(payload);
     }
 
+    console.log('   payload:', JSON.stringify(payload));
     const r = await fetch(buyer.webhook_url, {
       method: buyer.webhook_method || 'POST',
       headers,
@@ -671,7 +715,7 @@ wss.on('connection', (ws) => {
                 meterAgenteIntro();
 
                 // el webhook al CRM devuelve el ghl_contact_id, que el QA reusa
-                const contactIdPromise = dispararWebhookBuyer(buyerLabel, leadPhone, leadDebt);
+                const contactIdPromise = dispararWebhookBuyer(buyerLabel, leadPhone, leadDebt, conferenceName);
 
                 programarQA({
                   rootSid,
