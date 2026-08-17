@@ -148,6 +148,13 @@ function toIsoDate(v) {
   const raw = s(v);
   if (!raw) return '';
   if (/^\d{4}-\d{2}-\d{2}$/.test(raw)) return raw;
+  // GHL devuelve dateOfBirth como timestamp en milisegundos (ej. 658281600000).
+  // Parsearlo como texto falla y el buyer recibe la fecha vacia.
+  if (/^-?\d{10,13}$/.test(raw)) {
+    const ms = raw.length <= 10 ? Number(raw) * 1000 : Number(raw);
+    const dt = new Date(ms);
+    return isNaN(dt.getTime()) ? '' : dt.toISOString().slice(0, 10);
+  }
   const d = new Date(raw);
   if (isNaN(d.getTime())) return '';
   return d.toISOString().slice(0, 10);
@@ -247,7 +254,7 @@ function armarVariables(c, fallbackPhone, fallbackDebt) {
     company_name: s(c.companyName) || s(c.businessName),
     debt: debt,
     debt_number: toNumber(debt),
-    date_birth: s(c.dateOfBirth) || s(cv('date_birth')),
+    date_birth: toIsoDate(s(c.dateOfBirth) || s(cv('date_birth'))),
     date_birth_iso: toIsoDate(s(c.dateOfBirth) || s(cv('date_birth'))),
     mca_debt_total: s(cv('mca_debt_total')),
     weekly_mca_payment: s(cv('weekly_mca_payment')),
