@@ -338,7 +338,6 @@ async function traerBuyer(label) {
 async function dispararWebhookBuyer(buyerLabel, leadPhone, leadDebt, conf) {
   let contactId = '';
   try {
-    await new Promise((r) => setTimeout(r, 10000));
     let contacto = null;
     const idGuardado = await contactIdDeLaConference(conf);
     if (idGuardado) contacto = await traerContactoPorId(idGuardado);
@@ -356,29 +355,55 @@ async function dispararWebhookBuyer(buyerLabel, leadPhone, leadDebt, conf) {
       return contactId;
     }
 
-    const payload = rellenarTemplate(buyer.webhook_template, vars);
-    const headers = Object.assign({}, buyer.webhook_headers || {});
-    let body;
-    if (buyer.webhook_content_type === 'form') {
-      headers['Content-Type'] = 'application/x-www-form-urlencoded';
-      body = new URLSearchParams(payload).toString();
-    } else {
-      headers['Content-Type'] = 'application/json';
-      body = JSON.stringify(payload);
+    // Primer intento inmediato. Si el buyer rechaza por datos incompletos,
+    // el contacto en GHL todavia no termino de escribirse: se relee y se
+    // reintenta. No adivinamos cuanto tarda GHL, reaccionamos al error real.
+    const MAX_REINTENTOS = 4;   // 1 inmediato + 3 reintentos
+    const ESPERA_MS = 5000;
+
+    async function enviar(contactoActual) {
+      const v = armarVariables(contactoActual, leadPhone, leadDebt);
+      const payload = rellenarTemplate(buyer.webhook_template, v);
+      const headers = Object.assign({}, buyer.webhook_headers || {});
+      let body;
+      if (buyer.webhook_content_type === 'form') {
+        headers['Content-Type'] = 'application/x-www-form-urlencoded';
+        body = new URLSearchParams(payload).toString();
+      } else {
+        headers['Content-Type'] = 'application/json';
+        body = JSON.stringify(payload);
+      }
+      const r = await fetch(buyer.webhook_url, {
+        method: buyer.webhook_method || 'POST',
+        headers,
+        body,
+      });
+      const txt = r.ok ? '' : await r.text().catch(() => '');
+      return { ok: r.ok, status: r.status, txt, payload };
     }
 
-    console.log('   payload:', JSON.stringify(payload));
-    const r = await fetch(buyer.webhook_url, {
-      method: buyer.webhook_method || 'POST',
-      headers,
-      body,
-    });
+    let contactoActual = contacto;
+    for (let intento = 1; intento <= MAX_REINTENTOS; intento++) {
+      const res = await enviar(contactoActual);
 
-    if (r.ok) {
-      console.log(`   📤 webhook ${buyerLabel} OK (${r.status}) | contacto ${contactId}`);
-    } else {
-      const txt = await r.text().catch(() => '');
-      console.error(`   ❌ webhook ${buyerLabel} fallo ${r.status}: ${txt.slice(0, 200)}`);
+      if (res.ok) {
+        console.log(`   📤 webhook ${buyerLabel} OK (${res.status}) intento ${intento} | contacto ${contactId}`);
+        break;
+      }
+
+      const incompleto = res.status === 422 || /required|incomplete/i.test(res.txt);
+      if (!incompleto || intento === MAX_REINTENTOS) {
+        console.error(`   ❌ webhook ${buyerLabel} fallo ${res.status} (intento ${intento}): ${res.txt.slice(0, 200)}`);
+        console.error(`   📦 payload: ${JSON.stringify(res.payload)}`);
+        break;
+      }
+
+      console.warn(`   ⏳ ${buyerLabel} rechazo por datos incompletos (intento ${intento}), releyendo GHL en ${ESPERA_MS / 1000}s`);
+      await new Promise((r) => setTimeout(r, ESPERA_MS));
+
+      const refrescado = (idGuardado && await traerContactoPorId(idGuardado)) ||
+        await buscarContactoGHL(leadPhone);
+      if (refrescado) contactoActual = refrescado;
     }
   } catch (e) {
     console.error(`   ❌ webhook ${buyerLabel} error:`, e.message);
