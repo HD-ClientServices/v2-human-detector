@@ -40,17 +40,26 @@ const carreras = new Map();
 function getCarrera(conf) {
   if (!conf) return null;
   if (!carreras.has(conf)) {
-    carreras.set(conf, { ganador: null, piernas: {}, agotados: new Set(), buyers: new Set(), rootSid: null });
+    carreras.set(conf, {
+      ganador: null, piernas: {}, agotados: new Set(), buyers: new Set(),
+      rootSid: null, leadPhone: '', leadName: '', agentKey: '',
+    });
   }
   return carreras.get(conf);
 }
 
-function registrarPierna(conf, label, callSid, rootSid) {
+function registrarPierna(conf, label, callSid, rootSid, ctx) {
   const c = getCarrera(conf);
   if (!c) return;
   c.piernas[label] = callSid;
   c.buyers.add(label);
   if (rootSid) c.rootSid = rootSid;
+  // contexto del lead: se necesita para avisar a GHL si nadie lo atiende
+  if (ctx) {
+    if (ctx.leadPhone) c.leadPhone = ctx.leadPhone;
+    if (ctx.leadName) c.leadName = ctx.leadName;
+    if (ctx.agentKey) c.agentKey = ctx.agentKey;
+  }
 }
 
 function hayGanador(conf) {
@@ -95,7 +104,55 @@ async function marcarAgotado(conf, label) {
     } catch (e) {
       console.error('   ❌ error cortando al lead:', e.message);
     }
+
+    // Este lead califico, espero varios minutos y nadie lo atendio.
+    // Se avisa a GHL para que el agente de reconexion lo recupere mas tarde.
+    await avisarLeadPerdido(conf, c);
+
     carreras.delete(conf);
+  }
+}
+
+// Avisa a GHL que un lead calificado se quedo sin closer.
+// El workflow del otro lado decide cuando y con que agente reconectarlo.
+async function avisarLeadPerdido(conf, carrera) {
+  const url = process.env.GHL_NO_CLOSER_WEBHOOK_URL;
+  if (!url) {
+    console.log('   ℹ️  falta GHL_NO_CLOSER_WEBHOOK_URL, no se avisa el lead perdido');
+    return;
+  }
+
+  let ghlContactId = '';
+  try {
+    ghlContactId = await contactIdDeLaConference(conf);
+  } catch (e) {}
+
+  const payload = {
+    reason: 'no_closer_available',
+    lead_phone: carrera.leadPhone || '',
+    agent_key: carrera.agentKey || '',
+    lead_name: carrera.leadName || '',
+    ghl_contact_id: ghlContactId,
+    buyers_tried: [...carrera.buyers].join(','),
+    conference: conf,
+    root_call_sid: carrera.rootSid || '',
+    failed_at: new Date().toISOString(),
+  };
+
+  try {
+    const r = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    if (r.ok) {
+      console.log(`   📤 lead perdido avisado a GHL (${r.status}) | ${payload.lead_phone} | ${payload.agent_key}`);
+    } else {
+      const txt = await r.text().catch(() => '');
+      console.error(`   ❌ aviso de lead perdido fallo ${r.status}: ${txt.slice(0, 200)}`);
+    }
+  } catch (e) {
+    console.error('   ❌ aviso de lead perdido error:', e.message);
   }
 }
 
@@ -670,7 +727,9 @@ wss.on('connection', (ws) => {
           rootSid = p.root_sid || '';
           agentKey = (p.agent_key || '').toLowerCase();
         }
-        registrarPierna(conferenceName, buyerLabel, callSid, rootSid);
+        registrarPierna(conferenceName, buyerLabel, callSid, rootSid, {
+          leadPhone, leadName, agentKey,
+        });
         console.log(`▶️  ${buyerLabel} intento ${attempt}/${MAX_ATTEMPTS} | conf: ${conferenceName}`);
         armarTimer();
         break;
