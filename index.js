@@ -105,9 +105,20 @@ async function marcarAgotado(conf, label) {
       console.error('   ❌ error cortando al lead:', e.message);
     }
 
-    // Este lead califico, espero varios minutos y nadie lo atendio.
-    // Se avisa a GHL para que el agente de reconexion lo recupere mas tarde.
-    await avisarLeadPerdido(conf, c);
+    // Solo avisar si el lead seguia en linea. Si ya habia colgado, el
+    // statusCallback (/lead-colgo) ya notifico: avisar de nuevo aca le
+    // genera dos llamadas de reconexion por el mismo evento.
+    let leadSeguiaEnLinea = false;
+    try {
+      const llamada = await twilioClient.calls(c.rootSid).fetch();
+      leadSeguiaEnLinea = llamada.status === 'in-progress';
+    } catch (e) {}
+
+    if (leadSeguiaEnLinea) {
+      await avisarLeadPerdido(conf, c);
+    } else {
+      console.log('   ℹ️  el lead ya habia colgado, /lead-colgo se encarga del aviso');
+    }
 
     carreras.delete(conf);
   }
@@ -115,6 +126,30 @@ async function marcarAgotado(conf, label) {
 
 // Avisa a GHL que un lead calificado se quedo sin closer.
 // El workflow del otro lado decide cuando y con que agente reconectarlo.
+// Marca la llamada como transferida. Sirve para distinguir, cuando la
+// llamada del lead termine, si hablo con un closer o si colgo esperando.
+async function marcarTransferido(conf) {
+  if (!conf) return;
+  try {
+    const sufijo = conf.replace('transfer_', '');
+    await fetch(
+      process.env.SUPABASE_URL + '/rest/v1/v2_call_map?retell_call_id=like.*' + encodeURIComponent(sufijo),
+      {
+        method: 'PATCH',
+        headers: {
+          apikey: process.env.SUPABASE_SERVICE_KEY,
+          Authorization: 'Bearer ' + process.env.SUPABASE_SERVICE_KEY,
+          'Content-Type': 'application/json',
+          Prefer: 'return=minimal',
+        },
+        body: JSON.stringify({ status: 'transferred' }),
+      }
+    );
+  } catch (e) {
+    console.error('   ❌ no pude marcar transferido:', e.message);
+  }
+}
+
 async function avisarLeadPerdido(conf, carrera) {
   const url = process.env.GHL_NO_CLOSER_WEBHOOK_URL;
   if (!url) {
@@ -798,6 +833,7 @@ wss.on('connection', (ws) => {
                 console.log(`    señales: ${[...r.fuertes, ...r.debiles].join(', ')}`);
                 console.log('');
 
+                marcarTransferido(conferenceName);
                 cancelarPerdedores(conferenceName, buyerLabel);
                 moverAConference();
                 meterAgenteIntro();
